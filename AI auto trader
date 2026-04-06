@@ -1,0 +1,582 @@
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import alpaca_trade_api as tradeapi
+import time
+import os
+from datetime import datetime, timedelta
+import pytz
+
+# =========================================================
+# SAFETY MODE
+# =========================================================
+MODE = "PAPER_ONLY"   # LOCKED. Do not change.
+KILL_SWITCH = False   # Set True to pause all new entries
+
+# =========================================================
+# SETTINGS
+# =========================================================
+SYMBOLS = ["AAPL", "NVDA", "AMD", "META", "TSLA", "SPY"]
+MARKET_FILTER_SYMBOL = "SPY"
+
+RISK_PER_TRADE = 0.01
+BOX_PERIOD = 30
+POLL_INTERVAL = 300          # 5 minutes
+TIMEFRAME = "5m"
+DATA_PERIOD = "1mo"
+
+MAX_TRADES_PER_DAY = 3
+MAX_DAILY_LOSS_PCT = 0.03
+COOLDOWN_MINUTES = 30
+
+TRAILING_STOP_ATR = 1.2
+STOP_ATR_MULT = 1.5
+TP_ATR_MULT = 3.0
+BREAKOUT_BUFFER = 0.0015
+BOUNCE_BUFFER_ATR = 0.30
+MIN_VOLUME_MULT = 1.5
+
+SKIP_FIRST_MINUTES = 15
+MAX_OPEN_POSITIONS = 1
+
+TRADE_LOG_FILE = "trade_journal.csv"
+STATE_FILE = "paper_positions.csv"
+
+# =========================================================
+# ALPACA API (PAPER ACCOUNT ONLY FOR ACCOUNT INFO/CLOCK)
+# =========================================================
+API_KEY = "YOUR_ALPACA_KEY"
+API_SECRET = "YOUR_ALPACA_SECRET"
+BASE_URL = "https://paper-api.alpaca.markets"
+
+api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+
+# =========================================================
+# GLOBAL STATE
+# =========================================================
+last_trade_time = None
+trades_today = 0
+today_date = datetime.now().date()
+starting_equity_today = None
+
+# In-paper simulated positions
+# symbol -> dict
+positions = {}
+
+# =========================================================
+# UTIL
+# =========================================================
+def log(msg):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+def ensure_files():
+    if not os.path.exists(TRADE_LOG_FILE):
+        pd.DataFrame(columns=[
+            "timestamp", "symbol", "side", "entry_type", "qty",
+            "entry_price", "exit_price", "stop_loss", "take_profit",
+            "reason", "pnl_dollars", "pnl_pct"
+        ]).to_csv(TRADE_LOG_FILE, index=False)
+
+    if not os.path.exists(STATE_FILE):
+        pd.DataFrame(columns=[
+            "symbol", "entry_type", "qty", "entry_price", "stop_loss",
+            "take_profit", "highest_price", "entry_time"
+        ]).to_csv(STATE_FILE, index=False)
+
+def save_positions():
+    if positions:
+        rows = []
+        for sym, p in positions.items():
+            rows.append({
+                "symbol": sym,
+                "entry_type": p["entry_type"],
+                "qty": p["qty"],
+                "entry_price": p["entry_price"],
+                "stop_loss": p["stop_loss"],
+                "take_profit": p["take_profit"],
+                "highest_price": p["highest_price"],
+                "entry_time": p["entry_time"]
+            })
+        pd.DataFrame(rows).to_csv(STATE_FILE, index=False)
+    else:
+        pd.DataFrame(columns=[
+            "symbol", "entry_type", "qty", "entry_price", "stop_loss",
+            "take_profit", "highest_price", "entry_time"
+        ]).to_csv(STATE_FILE, index=False)
+
+def load_positions():
+    global positions
+    if os.path.exists(STATE_FILE):
+        df = pd.read_csv(STATE_FILE)
+        positions = {}
+        for _, row in df.iterrows():
+            positions[row["symbol"]] = {
+                "entry_type": row["entry_type"],
+                "qty": int(row["qty"]),
+                "entry_price": float(row["entry_price"]),
+                "stop_loss": float(row["stop_loss"]),
+                "take_profit": float(row["take_profit"]),
+                "highest_price": float(row["highest_price"]),
+                "entry_time": row["entry_time"]
+            }
+
+def reset_daily_counters():
+    global trades_today, today_date, starting_equity_today
+    current_date = datetime.now().date()
+    if current_date != today_date:
+        today_date = current_date
+        trades_today = 0
+        try:
+            starting_equity_today = float(api.get_account().equity)
+        except:
+            starting_equity_today = None
+        log("New trading day reset.")
+
+def get_account_cash():
+    try:
+        return float(api.get_account().cash)
+    except:
+        return 10000.0
+
+def get_account_equity():
+    try:
+        return float(api.get_account().equity)
+    except:
+        return 10000.0
+
+def daily_loss_exceeded():
+    global starting_equity_today
+    try:
+        if starting_equity_today is None:
+            starting_equity_today = get_account_equity()
+            return False
+        current_equity = get_account_equity()
+        drawdown = (starting_equity_today - current_equity) / starting_equity_today
+        return drawdown >= MAX_DAILY_LOSS_PCT
+    except:
+        return False
+
+def is_market_open():
+    try:
+        return api.get_clock().is_open
+    except:
+        return False
+
+def minutes_since_open():
+    try:
+        clock = api.get_clock()
+        ts = pd.Timestamp(clock.timestamp)
+        next_open = pd.Timestamp(clock.next_open)
+        # During market hours, "next_open" is tomorrow, so use 9:30 ET instead
+        eastern = pytz.timezone("US/Eastern")
+        now_et = datetime.now(eastern)
+        today_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        return int((now_et - today_open).total_seconds() / 60)
+    except:
+        return 999
+
+def cooldown_active():
+    global last_trade_time
+    if last_trade_time is None:
+        return False
+    return datetime.now() < last_trade_time + timedelta(minutes=COOLDOWN_MINUTES)
+
+def mark_trade_time():
+    global last_trade_time, trades_today
+    last_trade_time = datetime.now()
+    trades_today += 1
+
+def calculate_position_size(cash, risk, entry, stop):
+    risk_amount = cash * risk
+    per_share_risk = abs(entry - stop)
+    if per_share_risk <= 0:
+        return 0
+    size = int(risk_amount / per_share_risk)
+    max_affordable = int(cash / entry)
+    return max(0, min(size, max_affordable))
+
+def fetch_data(symbol, period=DATA_PERIOD, interval=TIMEFRAME):
+    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+    if df.empty:
+        return df
+    return df.dropna()
+
+# =========================================================
+# INDICATORS
+# =========================================================
+def add_indicators(data):
+    data = data.copy()
+
+    data['EMA50'] = data['Close'].ewm(span=50, adjust=False).mean()
+    data['EMA200'] = data['Close'].ewm(span=200, adjust=False).mean()
+
+    delta = data['Close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    data['RSI'] = 100 - (100 / (1 + rs))
+
+    high_low = data['High'] - data['Low']
+    high_close = (data['High'] - data['Close'].shift()).abs()
+    low_close = (data['Low'] - data['Close'].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    data['ATR'] = true_range.rolling(14).mean()
+
+    data['avg_volume'] = data['Volume'].rolling(20).mean()
+
+    return data.dropna()
+
+# =========================================================
+# MARKET FILTER
+# =========================================================
+def market_is_favorable():
+    spy = fetch_data(MARKET_FILTER_SYMBOL)
+    if spy.empty or len(spy) < 220:
+        return False
+
+    spy = add_indicators(spy)
+    if len(spy) < 5:
+        return False
+
+    last = spy.iloc[-2]  # last fully closed candle
+    trend_up = last['EMA50'] > last['EMA200']
+    rsi_ok = last['RSI'] > 45
+    return bool(trend_up and rsi_ok)
+
+# =========================================================
+# SIGNAL LOGIC
+# =========================================================
+def check_entry(symbol, data):
+    # Use last fully closed candle only
+    if len(data) < BOX_PERIOD + 5:
+        return None
+
+    last = data.iloc[-2]
+    prev = data.iloc[-3]
+
+    # Define box using prior candles only (excluding current signal candle)
+    window = data.iloc[-BOX_PERIOD-2:-2]
+
+    support = float(window['Low'].min())
+    resistance = float(window['High'].max())
+
+    price = float(last['Close'])
+    prev_close = float(prev['Close'])
+    rsi = float(last['RSI'])
+    atr = float(last['ATR'])
+    volume = float(last['Volume'])
+    avg_vol = float(last['avg_volume'])
+    trend_up = bool(last['EMA50'] > last['EMA200'])
+
+    near_support = price <= support + atr * BOUNCE_BUFFER_ATR
+
+    bounce_signal = (
+        near_support and
+        rsi < 38 and
+        trend_up and
+        price > prev_close
+    )
+
+    breakout_signal = (
+        price > resistance * (1 + BREAKOUT_BUFFER) and
+        prev_close <= resistance and
+        volume > avg_vol * MIN_VOLUME_MULT and
+        rsi > 50 and
+        trend_up
+    )
+
+    if bounce_signal:
+        stop_loss = price - atr * STOP_ATR_MULT
+        take_profit = resistance
+        return {
+            "symbol": symbol,
+            "type": "bounce",
+            "entry": price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "support": support,
+            "resistance": resistance,
+            "atr": atr
+        }
+
+    if breakout_signal:
+        stop_loss = price - atr * STOP_ATR_MULT
+        take_profit = price + atr * TP_ATR_MULT
+        return {
+            "symbol": symbol,
+            "type": "breakout",
+            "entry": price,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "support": support,
+            "resistance": resistance,
+            "atr": atr
+        }
+
+    return None
+
+# =========================================================
+# PAPER TRADING ENGINE
+# =========================================================
+def log_trade(timestamp, symbol, side, entry_type, qty, entry_price, exit_price,
+              stop_loss, take_profit, reason, pnl_dollars, pnl_pct):
+    row = pd.DataFrame([{
+        "timestamp": timestamp,
+        "symbol": symbol,
+        "side": side,
+        "entry_type": entry_type,
+        "qty": qty,
+        "entry_price": round(entry_price, 4) if entry_price is not None else None,
+        "exit_price": round(exit_price, 4) if exit_price is not None else None,
+        "stop_loss": round(stop_loss, 4) if stop_loss is not None else None,
+        "take_profit": round(take_profit, 4) if take_profit is not None else None,
+        "reason": reason,
+        "pnl_dollars": round(pnl_dollars, 2) if pnl_dollars is not None else None,
+        "pnl_pct": round(pnl_pct, 2) if pnl_pct is not None else None
+    }])
+    row.to_csv(TRADE_LOG_FILE, mode='a', header=False, index=False)
+
+def paper_buy(entry_data):
+    global positions
+
+    symbol = entry_data["symbol"]
+    cash = get_account_cash()
+    size = calculate_position_size(cash, RISK_PER_TRADE, entry_data["entry"], entry_data["stop_loss"])
+
+    if size <= 0:
+        log(f"{symbol}: Position size too small. Skipping.")
+        return False
+
+    positions[symbol] = {
+        "entry_type": entry_data["type"],
+        "qty": size,
+        "entry_price": entry_data["entry"],
+        "stop_loss": entry_data["stop_loss"],
+        "take_profit": entry_data["take_profit"],
+        "highest_price": entry_data["entry"],
+        "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "resistance": entry_data["resistance"]
+    }
+
+    save_positions()
+    mark_trade_time()
+
+    log(
+        f"PAPER BUY {symbol} {entry_data['type'].upper()} | "
+        f"Price: {entry_data['entry']:.2f} | "
+        f"SL: {entry_data['stop_loss']:.2f} | "
+        f"TP: {entry_data['take_profit']:.2f} | "
+        f"Shares: {size}"
+    )
+
+    log_trade(
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        symbol=symbol,
+        side="BUY",
+        entry_type=entry_data["type"],
+        qty=size,
+        entry_price=entry_data["entry"],
+        exit_price=None,
+        stop_loss=entry_data["stop_loss"],
+        take_profit=entry_data["take_profit"],
+        reason="entry",
+        pnl_dollars=None,
+        pnl_pct=None
+    )
+
+    return True
+
+def paper_sell(symbol, price, reason):
+    global positions
+
+    if symbol not in positions:
+        return False
+
+    p = positions[symbol]
+    qty = p["qty"]
+    entry_price = p["entry_price"]
+
+    pnl_dollars = (price - entry_price) * qty
+    pnl_pct = ((price - entry_price) / entry_price) * 100
+
+    log(
+        f"PAPER SELL {symbol} {reason.upper()} | "
+        f"Exit: {price:.2f} | Entry: {entry_price:.2f} | "
+        f"Qty: {qty} | PnL: ${pnl_dollars:.2f} ({pnl_pct:.2f}%)"
+    )
+
+    log_trade(
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        symbol=symbol,
+        side="SELL",
+        entry_type=p["entry_type"],
+        qty=qty,
+        entry_price=entry_price,
+        exit_price=price,
+        stop_loss=p["stop_loss"],
+        take_profit=p["take_profit"],
+        reason=reason,
+        pnl_dollars=pnl_dollars,
+        pnl_pct=pnl_pct
+    )
+
+    del positions[symbol]
+    save_positions()
+    mark_trade_time()
+    return True
+
+def manage_position(symbol, data):
+    if symbol not in positions:
+        return
+
+    p = positions[symbol]
+    last = data.iloc[-2]  # last fully closed candle
+    price = float(last['Close'])
+    atr = float(last['ATR'])
+
+    # Update highest price
+    if price > p["highest_price"]:
+        p["highest_price"] = price
+
+    # Trailing stop
+    trailing_stop = p["highest_price"] - atr * TRAILING_STOP_ATR
+    effective_stop = max(p["stop_loss"], trailing_stop)
+
+    # Exit checks
+    if price <= effective_stop:
+        paper_sell(symbol, price, "stop_loss")
+        return
+
+    if price >= p["take_profit"]:
+        paper_sell(symbol, price, "take_profit")
+        return
+
+    if p["entry_type"] == "bounce" and price >= p["resistance"] * 0.99:
+        paper_sell(symbol, price, "range_exit")
+        return
+
+    positions[symbol]["highest_price"] = p["highest_price"]
+    save_positions()
+
+# =========================================================
+# BEST SETUP PICKER
+# =========================================================
+def score_setup(entry):
+    """
+    Higher score = stronger setup
+    """
+    if entry is None:
+        return -999
+
+    score = 0
+
+    if entry["type"] == "breakout":
+        score += 3
+    if entry["type"] == "bounce":
+        score += 2
+
+    # Better RR gets more points
+    rr = (entry["take_profit"] - entry["entry"]) / max(0.01, (entry["entry"] - entry["stop_loss"]))
+    score += min(rr, 5)
+
+    return score
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+ensure_files()
+load_positions()
+log("Starting PAPER-ONLY Box Theory bot...")
+
+try:
+    starting_equity_today = get_account_equity()
+except:
+    starting_equity_today = None
+
+while True:
+    try:
+        reset_daily_counters()
+
+        if KILL_SWITCH:
+            log("KILL SWITCH ACTIVE. No new trades.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if not is_market_open():
+            log("Market closed. Waiting...")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if minutes_since_open() < SKIP_FIRST_MINUTES:
+            log("Skipping opening volatility window...")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if daily_loss_exceeded():
+            log("Max daily loss reached. Trading paused for today.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if trades_today >= MAX_TRADES_PER_DAY:
+            log("Max trades reached for today.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        # Manage existing positions first
+        for symbol in list(positions.keys()):
+            data = fetch_data(symbol)
+            if data.empty or len(data) < 220:
+                continue
+            data = add_indicators(data)
+            if len(data) < BOX_PERIOD + 5:
+                continue
+            manage_position(symbol, data)
+
+        # No new entries if cooldown or too many open positions
+        if cooldown_active():
+            log("Cooldown active. Waiting...")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if len(positions) >= MAX_OPEN_POSITIONS:
+            log("Max open positions reached.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if not market_is_favorable():
+            log("SPY market filter says conditions are not favorable.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        # Scan for best setup
+        candidates = []
+
+        for symbol in SYMBOLS:
+            if symbol in positions:
+                continue
+
+            data = fetch_data(symbol)
+            if data.empty or len(data) < 220:
+                continue
+
+            data = add_indicators(data)
+            if len(data) < BOX_PERIOD + 5:
+                continue
+
+            entry = check_entry(symbol, data)
+            if entry:
+                candidates.append(entry)
+
+        if not candidates:
+            log("No trade setups found.")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        best_entry = max(candidates, key=score_setup)
+        paper_buy(best_entry)
+
+        time.sleep(POLL_INTERVAL)
+
+    except Exception as e:
+        log(f"Error: {e}")
+        time.sleep(POLL_INTERVAL)
